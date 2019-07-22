@@ -1,97 +1,34 @@
-import { resolve, escapeTextForBrowser, flattenOptionChildren, createOpenTagMarkup, flattenTopLevelChildren } from "./react-util";
+import { escapeTextForBrowser, flattenOptionChildren, createOpenTagMarkup, flattenTopLevelChildren } from "./react-util";
 import { invariant, warning } from "./react-log";
+import { resolve } from "./resolve";
 import * as REACT from "./react-types";
 import * as TAGS from "./react-tags";
 
 const React = require(`react`);
 const toArray = React.Children.toArray;
 
-function getNonChildrenInnerMarkup(props) {
-  const innerHTML = props.dangerouslySetInnerHTML;
-  if (innerHTML != null) {
-    if (innerHTML.__html != null) {
-      return innerHTML.__html;
-    }
-  } else {
-    const content = props.children;
-    if (typeof content === `string` || typeof content === `number`) {
-      return escapeTextForBrowser(content);
-    }
-  }
-  return null;
-}
-
-const HTML_NAMESPACE = `http://www.w3.org/1999/xhtml`;
-const MATH_NAMESPACE = `http://www.w3.org/1998/Math/MathML`;
-const SVG_NAMESPACE = `http://www.w3.org/2000/svg`;
-
-const Namespaces = {
-  html: HTML_NAMESPACE,
-  mathml: MATH_NAMESPACE,
-  svg: SVG_NAMESPACE
-};
-
-// Assumes there is no parent namespace.
-function getIntrinsicNamespace(type) {
-  switch (type) {
-    case `svg`:
-      return SVG_NAMESPACE;
-    case `math`:
-      return MATH_NAMESPACE;
-    default:
-      return HTML_NAMESPACE;
-  }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function getChildNamespace(parentNamespace, type) {
-  if (parentNamespace == null || parentNamespace === HTML_NAMESPACE) {
-    // No (or default) parent namespace: potential entry point.
-    return getIntrinsicNamespace(type);
-  }
-  if (parentNamespace === SVG_NAMESPACE && type === `foreignObject`) {
-    // We're leaving SVG.
-    return HTML_NAMESPACE;
-  }
-  // By default, pass namespace below.
-  return parentNamespace;
-}
-
 export default class ReactDOMServerRenderer {
-  threadID: number;
-  stack: any;
-  exhausted: boolean;
-  currentSelectValue: any;
-  previousWasTextNode: boolean;
-  makeStaticMarkup: any;
-  contextIndex: number;
-  contextStack: any[];
-  contextValueStack: any[];
-  contextProviderStack: any[];
+  stack = [];
+  makeStaticMarkup: false;
+  exhausted = false;
+  currentSelectValue = null;
+  previousWasTextNode = false;
+  // Context (new API)
+  contextIndex = -1;
+  contextStack = [];
+  contextValueStack = [];
 
   constructor(children: any, makeStaticMarkup: any) {
     this.stack = [
       {
         type: null,
-        // Assume all trees start in the HTML namespace (not totally true, but
-        // this is what we did historically)
-        domNamespace: Namespaces.html,
         children: flattenTopLevelChildren(children),
         childIndex: 0,
         context: {},
         footer: ``
       }
     ];
-    this.exhausted = false;
-    this.currentSelectValue = null;
-    this.previousWasTextNode = false;
     this.makeStaticMarkup = makeStaticMarkup;
-
-    // Context (new API)
-    this.contextIndex = -1;
-    this.contextStack = [];
-    this.contextValueStack = [];
-    this.contextProviderStack = [];
   }
 
   destroy() {
@@ -102,44 +39,22 @@ export default class ReactDOMServerRenderer {
   }
 
   pushProvider(provider) {
+    // 之所以需要push，是因为可以存在多个相同的Provider
     const index = ++this.contextIndex;
     const context = provider.type._context;
     const previousValue = context[0];
-
-    // Remember which value to restore this context to on our way up.
     this.contextStack[index] = context;
     this.contextValueStack[index] = previousValue;
-    {
-      // Only used for push/pop mismatch warnings.
-      this.contextProviderStack[index] = provider;
-    }
-
-    // Mutate the current value.
     context[0] = provider.props.value;
   }
 
-  popProvider(provider) {
+  popProvider() {
     const index = this.contextIndex;
-    {
-      !(index > -1 && provider === this.contextProviderStack[index]) ? warning(false, `Unexpected pop.`) : void 0;
-    }
-
     const context = this.contextStack[index];
     const previousValue = this.contextValueStack[index];
-
-    // "Hide" these null assignments from Flow by using `any`
-    // because conceptually they are deletions--as long as we
-    // promise to never access values beyond `this.contextIndex`.
     this.contextStack[index] = null;
     this.contextValueStack[index] = null;
-    {
-      this.contextProviderStack[index] = null;
-    }
     this.contextIndex--;
-
-    // Restore to the previous value we stored as we were walking down.
-    // We've already verified that this context has been expanded to accommodate
-    // this thread id, so we don't need to do it again.
     context[0] = previousValue;
   }
 
@@ -173,8 +88,7 @@ export default class ReactDOMServerRenderer {
         if (frame.type === `select`) {
           this.currentSelectValue = null;
         } else if (frame.type != null && frame.type.type != null && frame.type.type.$$typeof === REACT.PROVIDER_TYPE) {
-          const provider = frame.type;
-          this.popProvider(provider);
+          this.popProvider();
         } else if (frame.type === REACT.SUSPENSE_TYPE) {
           invariant(false, `ReactDOMServer does not yet support Suspense.`);
         }
@@ -183,12 +97,12 @@ export default class ReactDOMServerRenderer {
         continue;
       }
       const child = frame.children[frame.childIndex++];
-      out += this.render(child, frame.context, frame.domNamespace);
+      out += this.render(child, frame.context);
     }
     return out;
   }
 
-  render(child, context, parentNamespace) {
+  render(child, context) {
     if (typeof child === `string` || typeof child === `number`) {
       const text = `` + child;
       if (text === ``) {
@@ -225,7 +139,6 @@ export default class ReactDOMServerRenderer {
         const nextChildren = toArray(nextChild);
         const frame = {
           type: null,
-          domNamespace: parentNamespace,
           children: nextChildren,
           childIndex: 0,
           context: context,
@@ -240,7 +153,7 @@ export default class ReactDOMServerRenderer {
 
       // 如果是 dom 节点，就直接输出
       if (typeof elementType === `string`) {
-        return this.renderDOM(nextElement, context, parentNamespace);
+        return this.renderDOM(nextElement, context);
       }
 
       switch (elementType) {
@@ -250,7 +163,6 @@ export default class ReactDOMServerRenderer {
         case REACT.FRAGMENT_TYPE: {
           const _frame = {
             type: null,
-            domNamespace: parentNamespace,
             children: toArray(nextChild.props.children),
             childIndex: 0,
             context: context,
@@ -270,14 +182,13 @@ export default class ReactDOMServerRenderer {
           case REACT.FORWARD_REF_TYPE: {
             const element = nextChild;
             let _nextChildren4 = void 0;
-            const componentIdentity = {};
-            prepareToUseHooks(componentIdentity);
+            // const componentIdentity = {};
+            // repareToUseHooks(componentIdentity);
             _nextChildren4 = elementType.render(element.props, element.ref);
-            _nextChildren4 = finishHooks(elementType.render, element.props, _nextChildren4, element.ref);
+            // _nextChildren4 = finishHooks(elementType.render, element.props, _nextChildren4, element.ref);
             _nextChildren4 = toArray(_nextChildren4);
             const _frame4 = {
               type: null,
-              domNamespace: parentNamespace,
               children: _nextChildren4,
               childIndex: 0,
               context: context,
@@ -289,7 +200,6 @@ export default class ReactDOMServerRenderer {
           case REACT.MEMO_TYPE: {
             this.stack.push({
               type: null,
-              domNamespace: parentNamespace,
               children: [React.createElement(elementType.type, Object.assign({ ref: nextChild.ref }, nextChild.props))],
               childIndex: 0,
               context: context,
@@ -304,7 +214,6 @@ export default class ReactDOMServerRenderer {
 
             this.stack.push({
               type: provider,
-              domNamespace: parentNamespace,
               children: toArray(nextProps.children),
               childIndex: 0,
               context: context,
@@ -338,7 +247,6 @@ export default class ReactDOMServerRenderer {
             }
             this.stack.push({
               type: nextChild,
-              domNamespace: parentNamespace,
               children: toArray(nextChild.props.children(reactContext[0])),
               childIndex: 0,
               context: context,
@@ -361,19 +269,8 @@ export default class ReactDOMServerRenderer {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  renderDOM(element, context, parentNamespace) {
+  renderDOM(element, context) {
     const tag = element.type.toLowerCase();
-    let namespace = parentNamespace;
-    if (parentNamespace === Namespaces.html) {
-      // 如果是 svg 或者 mathml，会改变 namespace
-      namespace = getIntrinsicNamespace(tag);
-    }
-
-    if (namespace === Namespaces.html) {
-      // html标签必须小写
-      !(tag === element.type) ? warning(false, `<%s /> is using incorrect casing. Use lowercase for HTML elements.`, element.type) : void 0;
-    }
-
     let props = element.props;
     if (tag === `input`) {
       {
@@ -487,7 +384,7 @@ export default class ReactDOMServerRenderer {
     }
 
     // out 输出前半部分, footer 输出后半部分
-    let out = createOpenTagMarkup(element.type, tag, props, namespace, this.makeStaticMarkup, this.stack.length === 1);
+    let out = createOpenTagMarkup(element.type, tag, props, this.makeStaticMarkup, this.stack.length === 1);
     let footer = ``;
     // omittedCloseTags 表示是否自我闭合
     if (TAGS.omittedCloseTags.hasOwnProperty(tag)) {
@@ -496,9 +393,16 @@ export default class ReactDOMServerRenderer {
       out += `>`;
       footer = `</` + element.type + `>`;
     }
-    let children = void 0;
+
     // 如果 child 是文字或数字，直接输出
-    const innerMarkup = getNonChildrenInnerMarkup(props);
+    let innerMarkup: any = null;
+    if (props.dangerouslySetInnerHTML != null && props.dangerouslySetInnerHTML.__html != null) {
+      innerMarkup = props.dangerouslySetInnerHTML.__html;
+    } else if (typeof props.children === `string` || typeof props.children === `number`) {
+      innerMarkup = escapeTextForBrowser(props.children);
+    }
+
+    let children = void 0;
     if (innerMarkup != null) {
       children = [];
       // 有些标签会吃掉换行符（\n），所以需要补上
@@ -510,7 +414,6 @@ export default class ReactDOMServerRenderer {
       children = toArray(props.children);
     }
     const frame = {
-      domNamespace: getChildNamespace(parentNamespace, element.type),
       type: tag,
       children: children,
       childIndex: 0,
